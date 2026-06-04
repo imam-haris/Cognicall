@@ -13,6 +13,7 @@ export async function POST(req: NextRequest) {
     const signature = req.headers.get("x-signature");
     const apiKey = req.headers.get("x-api-key");
     if (!signature || !apiKey) {
+        console.error("Webhook Error 400: Missing signature or API key");
         return NextResponse.json(
             { error: "Missing signature or API key" },
             { status: 400 }
@@ -28,6 +29,7 @@ export async function POST(req: NextRequest) {
         payload = JSON.parse(body) as Record<string, unknown>;
     }
     catch {
+        console.error("Webhook Error 400: Invalid JSON payload in body");
         return NextResponse.json({ error: "Invalid error " }, { status: 400 });
     }
     const eventType = (payload as Record<string, unknown>)?.type;
@@ -52,6 +54,7 @@ export async function POST(req: NextRequest) {
                 )
             )
         if (!existingMeeting) {
+            console.error(`Webhook Error 400: Meeting not found or in an invalid state for agent connection. Meeting ID: ${meetingId}`);
             return NextResponse.json({ error: "Meeting not found " }, { status: 400 })
         }
         await db
@@ -71,20 +74,39 @@ export async function POST(req: NextRequest) {
         }
         const call = streamVideo.video.call("default", meetingId);
         console.log("Connecting OpenAI for meeting:", meetingId);
-        const realtimeClient = await streamVideo.video.connectOpenAi({
-            call,
-            openAiApiKey: process.env.OPENAI_API_KEY!,
-            agentUserId: existingAgent.id,
-        });
-        await realtimeClient.updateSession({
-            instructions: existingAgent.instructions,
-            modalities: ["text", "audio"],
-            input_audio_format: "pcm16",
-            output_audio_format: "pcm16",
-            turn_detection: {
-                type: "server_vad",
-            },
-        });
+        try {
+            const realtimeClient = await streamVideo.video.connectOpenAi({
+                call,
+                openAiApiKey: process.env.OPENAI_API_KEY!,
+                agentUserId: existingAgent.id,
+            });
+            
+            // Listen for specific errors from OpenAI's Realtime API
+            realtimeClient.on("error", (event: any) => {
+                console.error("\n=== OpenAI Realtime Error ===");
+                console.error(JSON.stringify(event, null, 2));
+                console.error("===============================\n");
+            });
+
+            realtimeClient.on("close", (event: any) => {
+                console.log("\n=== OpenAI Connection Closed ===");
+                console.log("Reason:", event);
+                console.log("================================\n");
+            });
+
+            await realtimeClient.updateSession({
+                instructions: existingAgent.instructions,
+                modalities: ["text", "audio"],
+                input_audio_format: "pcm16",
+                output_audio_format: "pcm16",
+                turn_detection: {
+                    type: "server_vad",
+                },
+            });
+            console.log("Successfully connected agent!");
+        } catch (error) {
+            console.error("Failed to connect agent to OpenAI Realtime API:", error);
+        }
         // console.log("MeetingId:", meetingId);
         // console.log("Existing meeting:", existingMeeting);
     }
@@ -94,8 +116,29 @@ export async function POST(req: NextRequest) {
         if (!meetingId) {
             return NextResponse.json({ error: "Missing meetingId " }, { status: 400 })
         }
-        const call = streamVideo.video.call("default", meetingId);
-        await call.end();
+
+        const [existingMeeting] = await db
+            .select()
+            .from(meetings)
+            .where(eq(meetings.id, meetingId));
+
+        if (existingMeeting) {
+            const call = streamVideo.video.call("default", meetingId);
+            try {
+                // Get live call state to check how many participants remain
+                const { call: callData } = await call.get();
+                const sessionCount = callData.session?.participants?.length ?? 0;
+                
+                // Only end the call when no human participants are left
+                // (agent alone = 1, so end when ≤ 1 participant remains)
+                if (sessionCount <= 1) {
+                    await call.end();
+                    console.log(`Call ended for meeting ${meetingId} — no human participants remaining.`);
+                }
+            } catch (error) {
+                console.error("Failed to check/end call:", error);
+            }
+        }
     }
     else if(eventType === "call.session_ended") {
         const event = payload as CallEndedEvent;
